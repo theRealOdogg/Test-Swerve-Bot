@@ -1,0 +1,193 @@
+// Copyright (c) 2024-2026 Az-FIRST
+// http://github.com/AZ-First
+//
+// This program is free software; you can redistribute it and/or
+// modify it under the terms of the GNU General Public License
+// version 3 as published by the Free Software Foundation or
+// available in the root directory of this project.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU General Public License for more details.
+//
+// Copyright (c) FIRST and other WPILib contributors.
+// Open Source Software; you can modify and/or share it under the terms of
+// the WPILib BSD license file in the root directory of this project.
+
+package frc.robot.subsystems.imu;
+
+import com.ctre.phoenix6.BaseStatusSignal;
+import com.ctre.phoenix6.StatusCode;
+import com.ctre.phoenix6.StatusSignal;
+import com.ctre.phoenix6.configs.Pigeon2Configuration;
+import com.ctre.phoenix6.hardware.Pigeon2;
+import edu.wpi.first.math.geometry.Translation3d;
+import edu.wpi.first.math.util.Units;
+import edu.wpi.first.units.measure.Angle;
+import edu.wpi.first.units.measure.AngularVelocity;
+import edu.wpi.first.units.measure.LinearAcceleration;
+import frc.robot.Constants;
+import frc.robot.subsystems.drive.PhoenixOdometryThread;
+import frc.robot.subsystems.drive.SwerveConstants;
+import frc.robot.util.RBSICANBusRegistry;
+import java.util.Iterator;
+import java.util.Queue;
+
+/** IMU IO for CTRE Pigeon2 */
+public class ImuIOPigeon2 implements ImuIO {
+
+  // Define the Pigeon2 Hardware
+  private final Pigeon2 pigeon =
+      new Pigeon2(
+          SwerveConstants.kPigeonId, RBSICANBusRegistry.getBus(SwerveConstants.kCANbusName));
+
+  // Cached signals
+  private final StatusSignal<Angle> yawSignal = pigeon.getYaw();
+  private final StatusSignal<AngularVelocity> yawRateSignal = pigeon.getAngularVelocityZWorld();
+
+  private final StatusSignal<LinearAcceleration> accelX = pigeon.getAccelerationX();
+  private final StatusSignal<LinearAcceleration> accelY = pigeon.getAccelerationY();
+  private final StatusSignal<LinearAcceleration> accelZ = pigeon.getAccelerationZ();
+
+  private final Queue<Double> odomTimestamps;
+  private final Queue<Double> odomYawsDeg;
+
+  // Previous accel for jerk calculation (m/s/s)
+  private Translation3d prevAcc = Translation3d.kZero;
+  private long prevTimestampNs = 0L;
+
+  // Reusable buffers for queue-drain (to avoid using streams)
+  private double[] odomTsBuf = new double[8];
+  private double[] odomYawRadBuf = new double[8];
+
+  /** Constructor */
+  public ImuIOPigeon2() {
+    pigeon.getConfigurator().apply(new Pigeon2Configuration());
+    pigeon.getConfigurator().setYaw(0.0);
+
+    yawSignal.setUpdateFrequency(SwerveConstants.kOdometryFrequency);
+    yawRateSignal.setUpdateFrequency(50.0);
+
+    accelX.setUpdateFrequency(50.0);
+    accelY.setUpdateFrequency(50.0);
+    accelZ.setUpdateFrequency(50.0);
+
+    pigeon.optimizeBusUtilization();
+
+    odomTimestamps = PhoenixOdometryThread.getInstance().makeTimestampQueue();
+    odomYawsDeg = PhoenixOdometryThread.getInstance().registerSignal(yawSignal);
+  }
+
+  /** Update the Inputs */
+  @Override
+  public void updateInputs(ImuIOInputs inputs) {
+    final long start = System.nanoTime();
+
+    // Load the nanosecond timestamp
+    inputs.timestampNs = start;
+
+    StatusCode code = BaseStatusSignal.refreshAll(yawSignal, yawRateSignal, accelX, accelY, accelZ);
+    inputs.connected = code.isOK();
+
+    // Yaw / rate: Phoenix returns degrees and deg/s here; convert to radians
+    inputs.yawPositionRad = Units.degreesToRadians(yawSignal.getValueAsDouble());
+    inputs.yawRateRadPerSec = Units.degreesToRadians(yawRateSignal.getValueAsDouble());
+
+    // Accel: Phoenix returns "g" for these signals; convert to m/s/s
+    inputs.linearAccel =
+        new Translation3d(
+            accelX.getValueAsDouble() * Constants.kGravityMetersPerSecSq,
+            accelY.getValueAsDouble() * Constants.kGravityMetersPerSecSq,
+            accelZ.getValueAsDouble() * Constants.kGravityMetersPerSecSq);
+
+    // Jerk computed as (delta accel) / dt
+    if (prevTimestampNs != 0L) {
+      final double dt = (start - prevTimestampNs) * 1e-9;
+      // Only compute if `dt` is larger than 1 ms.
+      if (dt > 1e-6) {
+        inputs.linearJerk = inputs.linearAccel.minus(prevAcc).div(dt);
+      }
+    }
+
+    // Load "previous values" for the next loop
+    prevTimestampNs = start;
+    prevAcc = inputs.linearAccel;
+
+    // Drain odometry queues to primitive arrays (timestamps == doubles; yaws == degrees)
+    final int n = drainOdometryQueuesIntoBuffers();
+    if (n > 0) {
+      // If there's anything to drain...
+      final double[] tsOut = new double[n];
+      final double[] yawOut = new double[n];
+      System.arraycopy(odomTsBuf, 0, tsOut, 0, n);
+      System.arraycopy(odomYawRadBuf, 0, yawOut, 0, n);
+      inputs.odometryYawTimestamps = tsOut;
+      inputs.odometryYawPositionsRad = yawOut;
+    } else {
+      // ...otherwise return empty arrays
+      inputs.odometryYawTimestamps = EMPTY_DOUBLE_ARRAY;
+      inputs.odometryYawPositionsRad = EMPTY_DOUBLE_ARRAY;
+    }
+
+    // Compute how long this took in seconds
+    final long end = System.nanoTime();
+    inputs.latencySeconds = (end - start) * 1e-9;
+  }
+
+  /**
+   * Zero the YAW to this radian value
+   *
+   * @param yawRad The radian value to which to zero
+   */
+  @Override
+  public void zeroYawRad(double yawRad) {
+    pigeon.setYaw(Units.radiansToDegrees(yawRad));
+  }
+
+  /**
+   * Drain the Odometry Queues into a Buffer
+   *
+   * <p>Private function that does the heavy lifting of draining the queues
+   */
+  private int drainOdometryQueuesIntoBuffers() {
+    final int nTs = odomTimestamps.size();
+    final int nYaw = odomYawsDeg.size();
+    final int n = Math.min(nTs, nYaw);
+    if (n <= 0) {
+      odomTimestamps.clear();
+      odomYawsDeg.clear();
+      return 0;
+    }
+
+    ensureOdomCapacity(n);
+
+    // Iterate without streams (still boxed because Queue<Double>, but avoids stream overhead)
+    final Iterator<Double> itT = odomTimestamps.iterator();
+    final Iterator<Double> itY = odomYawsDeg.iterator();
+
+    int i = 0;
+    while (i < n && itT.hasNext() && itY.hasNext()) {
+      odomTsBuf[i] = itT.next();
+      odomYawRadBuf[i] = Units.degreesToRadians(itY.next());
+      i++;
+    }
+
+    odomTimestamps.clear();
+    odomYawsDeg.clear();
+    return i;
+  }
+
+  /**
+   * Check that buffer is big enough for this queue
+   *
+   * <p>Private function that ensures odometry buffer capacity
+   */
+  private void ensureOdomCapacity(int n) {
+    if (odomTsBuf.length >= n) return;
+    int newCap = odomTsBuf.length;
+    while (newCap < n) newCap *= 2;
+    odomTsBuf = new double[newCap];
+    odomYawRadBuf = new double[newCap];
+  }
+}

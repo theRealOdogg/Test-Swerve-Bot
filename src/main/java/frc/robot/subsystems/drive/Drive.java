@@ -1,0 +1,1030 @@
+// Copyright (c) 2024-2026 Az-FIRST
+// http://github.com/AZ-First
+//
+// This program is free software; you can redistribute it and/or
+// modify it under the terms of the GNU General Public License
+// version 3 as published by the Free Software Foundation or
+// available in the root directory of this project.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU General Public License for more details.
+//
+// Copyright (c) FIRST and other WPILib contributors.
+// Open Source Software; you can modify and/or share it under the terms of
+// the WPILib BSD license file in the root directory of this project.
+
+package frc.robot.subsystems.drive;
+
+import static edu.wpi.first.units.Units.Volts;
+import static frc.robot.subsystems.drive.SwerveConstants.*;
+
+import choreo.trajectory.SwerveSample;
+import com.pathplanner.lib.auto.AutoBuilder;
+import com.pathplanner.lib.config.PIDConstants;
+import com.pathplanner.lib.controllers.PPHolonomicDriveController;
+import com.pathplanner.lib.pathfinding.Pathfinding;
+import com.pathplanner.lib.util.PathPlannerLogging;
+import edu.wpi.first.hal.FRCNetComm.tInstances;
+import edu.wpi.first.hal.FRCNetComm.tResourceType;
+import edu.wpi.first.hal.HAL;
+import edu.wpi.first.math.MathUtil;
+import edu.wpi.first.math.controller.PIDController;
+import edu.wpi.first.math.controller.ProfiledPIDController;
+import edu.wpi.first.math.estimator.SwerveDrivePoseEstimator;
+import edu.wpi.first.math.geometry.Pose2d;
+import edu.wpi.first.math.geometry.Rotation2d;
+import edu.wpi.first.math.geometry.Translation2d;
+import edu.wpi.first.math.kinematics.ChassisSpeeds;
+import edu.wpi.first.math.kinematics.SwerveDriveKinematics;
+import edu.wpi.first.math.kinematics.SwerveModulePosition;
+import edu.wpi.first.math.kinematics.SwerveModuleState;
+import edu.wpi.first.math.trajectory.TrapezoidProfile;
+import edu.wpi.first.wpilibj.Alert;
+import edu.wpi.first.wpilibj.Alert.AlertType;
+import edu.wpi.first.wpilibj.DriverStation;
+import edu.wpi.first.wpilibj.DriverStation.Alliance;
+import edu.wpi.first.wpilibj.smartdashboard.Field2d;
+import edu.wpi.first.wpilibj.smartdashboard.SmartDashboard;
+import edu.wpi.first.wpilibj2.command.Command;
+import edu.wpi.first.wpilibj2.command.sysid.SysIdRoutine;
+import frc.robot.Constants;
+import frc.robot.Constants.AutoConstants;
+import frc.robot.Constants.DrivebaseConstants;
+import frc.robot.Constants.RobotConstants;
+import frc.robot.subsystems.imu.Imu;
+import frc.robot.util.ConcurrentTimeInterpolatableBuffer;
+import frc.robot.util.LocalADStarAK;
+import frc.robot.util.RBSIEnum.Mode;
+import frc.robot.util.RBSIParsing;
+import frc.robot.util.RBSISubsystem;
+import frc.robot.util.TimeUtil;
+import frc.robot.util.TimedPose;
+import java.util.Optional;
+import java.util.OptionalDouble;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantLock;
+import org.littletonrobotics.junction.AutoLogOutput;
+import org.littletonrobotics.junction.Logger;
+
+/**
+ * Drive subsystem (RBSISubsystem)
+ *
+ * <p>The Drive subsystem controls the individual swerve Modules and owns the odometry of the robot.
+ * The odometry is updated from both the swerve modules and (optionally) the vision subsystem.
+ */
+public class Drive extends RBSISubsystem {
+
+  // Declare Hardware
+  private final Imu imu;
+  private final Module[] modules = new Module[4]; // FL, FR, BL, BR
+  private final SysIdRoutine sysId;
+
+  // Pose Buffer Declarations
+  private final ConcurrentTimeInterpolatableBuffer<Pose2d> poseBuffer =
+      ConcurrentTimeInterpolatableBuffer.createBuffer(DrivebaseConstants.kPoseBufferHistorySecs);
+  private final ConcurrentTimeInterpolatableBuffer<Double> yawBuffer =
+      ConcurrentTimeInterpolatableBuffer.createDoubleBuffer(
+          DrivebaseConstants.kPoseBufferHistorySecs);
+  private final ConcurrentTimeInterpolatableBuffer<Double> yawRateBuffer =
+      ConcurrentTimeInterpolatableBuffer.createDoubleBuffer(
+          DrivebaseConstants.kPoseBufferHistorySecs);
+
+  // Declare an alert
+  private final Alert gyroDisconnectedAlert =
+      new Alert("Disconnected gyro, using kinematics as fallback.", AlertType.kError);
+
+  // Declare odometry and pose-related variables
+  // This one is package-private; used in DriveOdometry, PhoenixOdometryThread, and
+  // SparkOdometryThread
+  static final Lock odometryLock = new ReentrantLock();
+  private SwerveDriveKinematics kinematics = new SwerveDriveKinematics(getModuleTranslations());
+  private SwerveModulePosition[] lastModulePositions = // For delta tracking
+      new SwerveModulePosition[] {
+        new SwerveModulePosition(),
+        new SwerveModulePosition(),
+        new SwerveModulePosition(),
+        new SwerveModulePosition()
+      };
+  private SwerveDrivePoseEstimator m_PoseEstimator =
+      new SwerveDrivePoseEstimator(kinematics, Rotation2d.kZero, lastModulePositions, Pose2d.kZero);
+
+  // Declare PID controller and siumulation physics
+  private ProfiledPIDController angleController;
+  private DriveSimPhysics simPhysics;
+  private final Field2d field = new Field2d();
+
+  // Pose reset gate (vision + anything latency-sensitive)
+  private volatile long poseResetEpoch = 0; // monotonic counter
+  private volatile double lastPoseResetTimestamp = Double.NEGATIVE_INFINITY;
+
+  // Pose Regimes (ENABLED, DISABLED_COAST, DISABLE_STATIONARY)
+  private boolean lastEnabled = false;
+  private double disabledCoastUntilTs = Double.NEGATIVE_INFINITY;
+  private double disabledCoastStartTs = Double.NEGATIVE_INFINITY;
+  private final double[] lastWheelDistM = new double[4];
+  private boolean haveLastWheelDist = false;
+  private int stationaryLoops = 0;
+
+  // Related to vision injection of pose
+  private boolean disabledVisionInitialized = false;
+  private Pose2d lastDisabledVisionPose = new Pose2d();
+  private double lastDisabledVisionTs = Double.NaN;
+
+  /** Constructor */
+  public Drive(Imu imu) {
+    this.imu = imu;
+
+    // Define the Angle Controller
+    angleController =
+        new ProfiledPIDController(
+            DrivebaseConstants.kSpinP,
+            DrivebaseConstants.kSpinI,
+            DrivebaseConstants.kSpinD,
+            new TrapezoidProfile.Constraints(
+                getMaxAngularSpeedRadPerSec(), getMaxAngularAccelRadPerSecPerSec()));
+    angleController.enableContinuousInput(-Math.PI, Math.PI);
+    m_pathThetaController.enableContinuousInput(-Math.PI, Math.PI);
+
+    // If REAL (i.e., NOT simulation), parse out the module types
+    if (Constants.getMode() == Mode.REAL) {
+
+      // Case out the swerve types because Az-RBSI supports a lot
+      switch (Constants.getSwerveType()) {
+        case PHOENIX6:
+          // This one is easy because it's all CTRE all the time
+          for (int i = 0; i < 4; i++) {
+            modules[i] = new Module(new ModuleIOTalonFX(i), i);
+          }
+          break;
+
+        case YAGSL:
+          // Then parse the module(s)
+          Byte modType = RBSIParsing.parseModuleType();
+          for (int i = 0; i < 4; i++) {
+            switch (modType) {
+              case 0b00000000: // ALL-CTRE
+                if (kImuType.equals("navx") || kImuType.equals("navx_spi")) {
+                  modules[i] = new Module(new ModuleIOTalonFX(i), i);
+                } else {
+                  throw new RuntimeException(
+                      "For an all-CTRE drive base, use Phoenix Tuner X Swerve Generator instead of YAGSL!");
+                }
+                break;
+              case 0b00010000: // Blended Talon Drive / NEO Steer
+                modules[i] = new Module(new ModuleIOBlended(i), i);
+                break;
+              case 0b01010000: // NEO motors + CANcoder
+                modules[i] = new Module(new ModuleIOSparkCANcoder(i), i);
+                break;
+              case 0b01010100: // NEO motors + analog encoder
+                modules[i] = new Module(new ModuleIOSpark(i), i);
+                break;
+              default:
+                throw new RuntimeException("Invalid swerve module combination");
+            }
+          }
+          break;
+
+        default:
+          throw new RuntimeException("Invalid Swerve Drive Type");
+      }
+
+      // Start odometry thread (for the real robot)
+      PhoenixOdometryThread.getInstance().start();
+      SparkOdometryThread.getInstance().start();
+
+    } else {
+
+      // If SIM, just order up some SIM modules!
+      for (int i = 0; i < 4; i++) {
+        modules[i] = new Module(new ModuleIOSim(), i);
+      }
+
+      // Load the physics simulator
+      simPhysics =
+          new DriveSimPhysics(
+              kinematics,
+              RobotConstants.kMomentOfInertiaKgMetersSq, // kg m^2
+              RobotConstants.kMaxWheelTorqueNm); // Nm
+    }
+
+    // Usage reporting for swerve template
+    HAL.report(tResourceType.kResourceType_RobotDrive, tInstances.kRobotDriveSwerve_AdvantageKit);
+
+    // Configure Autonomous Path Building for PathPlanner based on `AutoType`
+    switch (Constants.getAutoType()) {
+      case PATHPLANNER:
+        try {
+          // Configure AutoBuilder for PathPlanner
+          AutoBuilder.configure(
+              this::getPose,
+              this::resetPose,
+              this::getChassisSpeeds,
+              (speeds, feedforwards) -> runVelocity(speeds),
+              new PPHolonomicDriveController(
+                  new PIDConstants(
+                      DrivebaseConstants.kStrafeP,
+                      DrivebaseConstants.kStrafeI,
+                      DrivebaseConstants.kStrafeD),
+                  new PIDConstants(
+                      DrivebaseConstants.kSpinP,
+                      DrivebaseConstants.kSpinI,
+                      DrivebaseConstants.kSpinD)),
+              AutoConstants.kPathPlannerConfig,
+              () -> DriverStation.getAlliance().orElse(Alliance.Blue) == Alliance.Red,
+              this);
+        } catch (Exception e) {
+          DriverStation.reportError(
+              "Failed to load PathPlanner config and configure AutoBuilder", e.getStackTrace());
+        }
+        Pathfinding.setPathfinder(new LocalADStarAK());
+        PathPlannerLogging.setLogActivePathCallback(
+            (activePath) -> {
+              Logger.recordOutput("Odometry/Trajectory", activePath.toArray(new Pose2d[0]));
+            });
+        PathPlannerLogging.setLogTargetPoseCallback(
+            (targetPose) -> {
+              Logger.recordOutput("Odometry/TrajectorySetpoint", targetPose);
+            });
+        break;
+
+      case CHOREO:
+        // Choreo autos are configured in RobotContainer through AutoFactory.
+        break;
+
+      case MANUAL:
+        // Nothing to be done for MANUAL; may just use AutoPilot
+        break;
+      default:
+    }
+
+    // Configure SysId for drivebase characterization
+    sysId =
+        new SysIdRoutine(
+            new SysIdRoutine.Config(
+                null,
+                null,
+                null,
+                (state) -> Logger.recordOutput("Drive/SysIdState", state.toString())),
+            new SysIdRoutine.Mechanism(
+                (voltage) -> runCharacterization(voltage.in(Volts)), null, this));
+
+    SmartDashboard.putData("Field", field);
+  }
+
+  /************************************************************************* */
+  /** Periodic function that is called each cycle by the command scheduler */
+  @Override
+  public void rbsiPeriodic() {
+
+    // The only function of the drive periodic() is to stop the modules if the DriverStation is
+    // diabled.
+    if (DriverStation.isDisabled()) {
+      for (var module : modules) module.stop();
+      Logger.recordOutput("SwerveStates/Setpoints", new SwerveModuleState[] {});
+      Logger.recordOutput("SwerveStates/SetpointsOptimized", new SwerveModuleState[] {});
+    }
+
+    field.setRobotPose(m_PoseEstimator.getEstimatedPosition());
+  }
+
+  /**
+   * Simulation Periodic Method
+   *
+   * <p>This function runs only for simulation, but does similar processing to the REAL periodic
+   * function. Instead of reading back what the modules actually say, use physics to predict where
+   * the module would have gone.
+   */
+  @Override
+  public void simulationPeriodic() {
+
+    // IMPORTANT: do not run sim physics during REPLAY
+    if (Constants.getMode() != Mode.SIM) return;
+
+    final double dt = Constants.kLoopPeriodSecs;
+
+    // Advance module wheel physics
+    for (int i = 0; i < modules.length; i++) {
+      modules[i].simulationPeriodic();
+    }
+
+    // Get module states from modules (ok to allocate; can be cached later if desired)
+    final SwerveModuleState[] moduleStates = new SwerveModuleState[modules.length];
+    for (int i = 0; i < modules.length; i++) {
+      moduleStates[i] = modules[i].getState();
+    }
+
+    // Update SIM physics (linear & angular motion of the robot)
+    simPhysics.update(moduleStates, dt);
+
+    // Feed the simulated IMU from authoritative physics
+    final double yawRad = simPhysics.getYaw().getRadians();
+    final double omegaRadPerSec = simPhysics.getOmegaRadPerSec();
+
+    final double ax = simPhysics.getLinearAccel().getX();
+    final double ay = simPhysics.getLinearAccel().getY();
+
+    imu.simulationSetYawRad(yawRad);
+    imu.simulationSetOmegaRadPerSec(omegaRadPerSec);
+    imu.simulationSetLinearAccelMps2(ax, ay, 0.0);
+
+    // Logging ONLY for physics (NOT estimator)
+    Logger.recordOutput("Sim/Pose", simPhysics.getPose());
+    Logger.recordOutput("Sim/YawRad", yawRad);
+    Logger.recordOutput("Sim/OmegaRadPerSec", omegaRadPerSec);
+    Logger.recordOutput("Sim/LinearAccelXY_mps2", new double[] {ax, ay});
+  }
+
+  /************************************************************************* */
+  /** Drive Base Action Functions ****************************************** */
+
+  /**
+   * Sets the swerve drive motors to brake/coast mode.
+   *
+   * @param brake True to set motors to brake mode, false for coast.
+   */
+  public void setMotorBrake(boolean brake) {
+    {
+      for (Module swerveModule : modules) {
+        swerveModule.setBrakeMode(brake);
+      }
+    }
+  }
+
+  /** Stop the drive. */
+  public void stop() {
+    runVelocity(new ChassisSpeeds());
+  }
+
+  /**
+   * Stops the drive and turns the modules to an X arrangement to resist movement. The modules will
+   * return to their normal orientations the next time a nonzero velocity is requested.
+   */
+  public void stopWithX() {
+    Rotation2d[] headings = new Rotation2d[4];
+    for (int i = 0; i < 4; i++) {
+      headings[i] = getModuleTranslations()[i].getAngle();
+    }
+    kinematics.resetHeadings(headings);
+    stop();
+  }
+
+  /**
+   * Runs the drive at the desired velocity.
+   *
+   * @param speeds Speeds in meters/sec
+   */
+  public void runVelocity(ChassisSpeeds speeds) {
+    // Calculate module setpoints
+    ChassisSpeeds discreteSpeeds = ChassisSpeeds.discretize(speeds, Constants.kLoopPeriodSecs);
+    SwerveModuleState[] setpointStates = kinematics.toSwerveModuleStates(discreteSpeeds);
+    SwerveDriveKinematics.desaturateWheelSpeeds(setpointStates, getMaxLinearSpeedMetersPerSec());
+
+    // Log unoptimized setpoints and setpoint speeds
+    Logger.recordOutput("SwerveStates/Setpoints", setpointStates);
+    Logger.recordOutput("SwerveChassisSpeeds/Setpoints", discreteSpeeds);
+
+    // Send setpoints to modules
+    for (int i = 0; i < 4; i++) {
+      modules[i].runSetpoint(setpointStates[i]);
+    }
+
+    // Log optimized setpoints (runSetpoint mutates each state)
+    Logger.recordOutput("SwerveStates/SetpointsOptimized", setpointStates);
+  }
+
+  /**
+   * Runs the drive in a straight line with the specified drive output
+   *
+   * @param output Specified drive output for characterization
+   */
+  public void runCharacterization(double output) {
+    for (int i = 0; i < 4; i++) {
+      modules[i].runCharacterization(output);
+    }
+  }
+
+  /**
+   * Reset the heading for the ProfiledPIDController
+   *
+   * <p>Call this when: (A) robot is disabled, (B) gyro is zeroed, (C) autonomous starts
+   */
+  public void resetHeadingController() {
+    angleController.reset(getHeading().getRadians());
+  }
+
+  /**
+   * Update the Disabled Coast State
+   *
+   * <p>The purpose of this function is to determine the coasting state of the robot on the ENABLE
+   * -> DISABLE edge. While the robot coasts to a stop, the wheel odometry will continue to
+   * integrate with usual vision input. Once the robot stops moving (within tolerance), the vision
+   * injection to the Pose will take over.
+   *
+   * @param enabledNow Are we enabled now?
+   * @param disabledNow Are we disabled now?
+   * @param now When is now?
+   * @param yawRateRadPerSec Current drivebase rotation rate
+   * @param odomPositions List of module odometry positions
+   */
+  public void updateDisabledCoastState(
+      boolean enabledNow,
+      boolean disabledNow,
+      double now,
+      double yawRateRadPerSec,
+      SwerveModulePosition[] odomPositions) {
+
+    // Don’t end coast “instantly” right after disable edge
+    final boolean pastMin =
+        (now - disabledCoastStartTs) >= DrivebaseConstants.kDisabledCoastMinSeconds;
+
+    // Detect ENABLED -> DISABLED edge -- set `disabledCoastUntilTs` when COAST-phase ends
+    if (lastEnabled && !enabledNow) {
+      disabledCoastStartTs = now;
+      disabledCoastUntilTs = now + DrivebaseConstants.kDisabledCoastSeconds;
+
+      stationaryLoops = 0;
+      haveLastWheelDist = false; // reset delta baseline on transition
+    }
+    lastEnabled = enabledNow;
+
+    // If not disabled, no coast.
+    if (!disabledNow) {
+      stationaryLoops = 0;
+      haveLastWheelDist = false;
+      return;
+    }
+
+    // If coast already expired, nothing to do.
+    if (!(now < disabledCoastUntilTs)) {
+      return;
+    }
+
+    // Need odometry positions to detect motion
+    if (odomPositions == null || odomPositions.length < 4) {
+      return;
+    }
+
+    // Compute max wheel delta this loop. The first sample after a reset only establishes the
+    // baseline and should not count as stationary.
+    double maxDelta = 0.0;
+    boolean hadLastWheelDist = haveLastWheelDist;
+    if (haveLastWheelDist) {
+      for (int i = 0; i < 4; i++) {
+        double dist = odomPositions[i].distanceMeters;
+        double d = Math.abs(dist - lastWheelDistM[i]);
+        if (d > maxDelta) maxDelta = d;
+      }
+    }
+
+    // Update baseline for next loop
+    for (int i = 0; i < 4; i++) {
+      lastWheelDistM[i] = odomPositions[i].distanceMeters;
+    }
+    haveLastWheelDist = true;
+
+    // Stationary test (must have baseline)
+    if (hadLastWheelDist
+        && maxDelta <= DrivebaseConstants.kStationaryMaxWheelDeltaM
+        && Math.abs(yawRateRadPerSec) <= DrivebaseConstants.kStationaryMaxYawRateRadPerSec) {
+      stationaryLoops++;
+    } else {
+      stationaryLoops = 0;
+    }
+
+    // End coast early if stationary long enough
+    if (pastMin && stationaryLoops >= DrivebaseConstants.kStationaryLoopsToEndCoast) {
+      disabledCoastUntilTs = now; // expires immediately
+    }
+
+    // Debug logs (optional)
+    Logger.recordOutput("Odometry/Coast/active", isDisabledCoast(now));
+    Logger.recordOutput("Odometry/Coast/untilTs", disabledCoastUntilTs);
+    Logger.recordOutput("Odometry/Coast/stationaryLoops", stationaryLoops);
+    Logger.recordOutput("Odometry/Coast/maxWheelDeltaM", maxDelta);
+    Logger.recordOutput("Odometry/Coast/yawRateRadPerSec", yawRateRadPerSec);
+  }
+
+  /************************************************************************* */
+  /** SysId Characterization Routines ************************************** */
+
+  /** Returns a command to run a quasistatic test in the specified direction. */
+  public Command sysIdQuasistatic(SysIdRoutine.Direction direction) {
+    return run(() -> runCharacterization(0.0))
+        .withTimeout(DrivebaseConstants.kSysIdPreRunStopSecs)
+        .andThen(sysId.quasistatic(direction));
+  }
+
+  /** Returns a command to run a dynamic test in the specified direction. */
+  public Command sysIdDynamic(SysIdRoutine.Direction direction) {
+    return run(() -> runCharacterization(0.0))
+        .withTimeout(DrivebaseConstants.kSysIdPreRunStopSecs)
+        .andThen(sysId.dynamic(direction));
+  }
+
+  /************************************************************************* */
+  /** Getter Functions ***************************************************** */
+
+  /** Returns the module array */
+  public Module[] getModules() {
+    return modules;
+  }
+
+  /** Return the prodiledPID angle controller */
+  public ProfiledPIDController getAngleController() {
+    return angleController;
+  }
+
+  /** Returns the module states (turn angles and drive velocities) for all of the modules. */
+  @AutoLogOutput(key = "SwerveStates/Measured")
+  private SwerveModuleState[] getModuleStates() {
+    SwerveModuleState[] states = new SwerveModuleState[4];
+    for (int i = 0; i < 4; i++) {
+      states[i] = modules[i].getState();
+    }
+    return states;
+  }
+
+  /** Returns the module positions (turn angles and drive positions) for all of the modules. */
+  @AutoLogOutput(key = "SwerveStates/Positions")
+  SwerveModulePosition[] getModulePositions() {
+    SwerveModulePosition[] states = new SwerveModulePosition[4];
+    for (int i = 0; i < 4; i++) {
+      states[i] = modules[i].getPosition();
+    }
+    return states;
+  }
+
+  /** Returns the measured chassis speeds of the robot. */
+  @AutoLogOutput(key = "SwerveChassisSpeeds/Measured")
+  public ChassisSpeeds getChassisSpeeds() {
+    return kinematics.toChassisSpeeds(getModuleStates());
+  }
+
+  /**
+   * Returns the current odometry pose.
+   *
+   * <p>If the code is running as pure simulation (i.e., not REPLAY of a log), return the simulated
+   * physics pose. Otherwise, return the pose from the pose estimator.
+   */
+  public Pose2d getPose() {
+    if (Constants.isPureSim()) {
+      return simPhysics.getPose();
+    }
+    return m_PoseEstimator.getEstimatedPosition();
+  }
+
+  /** Returns the current odometry YAW. */
+  @AutoLogOutput(key = "Odometry/Yaw")
+  public Rotation2d getHeading() {
+    if (Constants.isPureSim()) {
+      return simPhysics.getYaw();
+    }
+    return imu.getYaw();
+  }
+
+  /**
+   * Returns the measured chassis speeds of the modules in FIELD coordinates.
+   *
+   * <p>+X = field forward +Y = field left CCW+ = counterclockwise
+   */
+  @AutoLogOutput(key = "SwerveChassisSpeeds/FieldMeasured")
+  public ChassisSpeeds getFieldRelativeSpeeds() {
+    // Robot-relative measured speeds from modules
+    ChassisSpeeds robotRelative = getChassisSpeeds();
+    // Convert to field-relative using authoritative yaw
+    return ChassisSpeeds.fromRobotRelativeSpeeds(robotRelative, getHeading());
+  }
+
+  /**
+   * Returns the FIELD-relative linear velocity of the robot's center.
+   *
+   * <p>+X = field forward +Y = field left
+   */
+  @AutoLogOutput(key = "Drive/FieldLinearVelocity")
+  public Translation2d getFieldLinearVelocity() {
+    ChassisSpeeds fieldSpeeds = getFieldRelativeSpeeds();
+    return new Translation2d(fieldSpeeds.vxMetersPerSecond, fieldSpeeds.vyMetersPerSecond);
+  }
+
+  /** Returns interpolated odometry pose at a given timestamp. */
+  public Optional<Pose2d> getPoseAtTime(double timestampSeconds) {
+    return poseBuffer.getSample(timestampSeconds);
+  }
+
+  /** Returns the oldest timetamp in the current pose buffer */
+  public double getPoseBufferOldestTime() {
+    return poseBuffer.getOldestTimestamp().orElse(Double.NaN);
+  }
+
+  /** Returns the newest timetamp in the current pose buffer */
+  public double getPoseBufferNewestTime() {
+    return poseBuffer.getNewestTimestamp().orElse(Double.NaN);
+  }
+
+  /**
+   * Max abs yaw rate over [t0, t1] using buffered yaw-rate history
+   *
+   * @param t0 Interval start
+   * @param t1 interval end
+   * @return Maximum yaw rate
+   */
+  public OptionalDouble getMaxAbsYawRateRadPerSec(double t0, double t1) {
+    // If end before start, return empty
+    if (t1 < t0) return OptionalDouble.empty();
+
+    // Get the subset of entries from the buffer
+    var sub = yawRateBuffer.getSamplesInRange(t0, true, t1, true);
+    if (sub.isEmpty()) return OptionalDouble.empty();
+
+    double maxAbs = 0.0;
+    boolean any = false;
+    for (double v : sub.values()) {
+      any = true;
+      double a = Math.abs(v);
+      if (a > maxAbs) maxAbs = a;
+    }
+    // Return a value if there's anything to report, else empty
+    return any ? OptionalDouble.of(maxAbs) : OptionalDouble.empty();
+  }
+
+  /** Get the last EPOCH of a pose reset */
+  public long getPoseResetEpoch() {
+    return poseResetEpoch;
+  }
+
+  /** Get the last TIMESTAMP of a pose reset */
+  public double getLastPoseResetTimestamp() {
+    return lastPoseResetTimestamp;
+  }
+
+  /** Returns the maximum linear speed in meters per sec. */
+  public double getMaxLinearSpeedMetersPerSec() {
+    return DrivebaseConstants.kMaxLinearSpeedMetersPerSec;
+  }
+
+  /** Returns the maximum angular speed in radians per sec. */
+  public double getMaxAngularSpeedRadPerSec() {
+    return getMaxLinearSpeedMetersPerSec() / kDriveBaseRadiusMeters;
+  }
+
+  /** Returns the maximum linear acceleration in meters per sec per sec. */
+  public double getMaxLinearAccelMetersPerSecPerSec() {
+    return DrivebaseConstants.kMaxLinearAccelMetersPerSecSq;
+  }
+
+  /** Returns the maximum angular acceleration in radians per sec per sec */
+  public double getMaxAngularAccelRadPerSecPerSec() {
+    return getMaxLinearAccelMetersPerSecPerSec() / kDriveBaseRadiusMeters;
+  }
+
+  /** Returns an array of module translations. */
+  public static Translation2d[] getModuleTranslations() {
+    return new Translation2d[] {
+      new Translation2d(kFLXPosMeters, kFLYPosMeters),
+      new Translation2d(kFRXPosMeters, kFRYPosMeters),
+      new Translation2d(kBLXPosMeters, kBLYPosMeters),
+      new Translation2d(kBRXPosMeters, kBRYPosMeters)
+    };
+  }
+
+  /** Returns whether the robot is currently in the DISABLED_COAST state */
+  public boolean isDisabledCoast() {
+    return isDisabledCoast(TimeUtil.now());
+  }
+
+  /** Returns whether the robot was in the DISABLED_COAST state at time `timestamp` */
+  public boolean isDisabledCoast(double timestamp) {
+    return DriverStation.isDisabled() && (timestamp < disabledCoastUntilTs);
+  }
+
+  /** Returns the disabledCoastStartTs variable */
+  public double getDisabledCoastStartTs() {
+    return disabledCoastStartTs;
+  }
+
+  /** Returns the position of each module in radians. */
+  public double[] getWheelRadiusCharacterizationPositions() {
+    double[] values = new double[4];
+    for (int i = 0; i < 4; i++) {
+      values[i] = modules[i].getWheelRadiusCharacterizationPosition();
+    }
+    return values;
+  }
+
+  /** Returns the average velocity of the modules in rotations/sec (Phoenix native units). */
+  public double getFFCharacterizationVelocity() {
+    double output = 0.0;
+    for (int i = 0; i < 4; i++) {
+      output += modules[i].getFFCharacterizationVelocity() / 4.0;
+    }
+    return output;
+  }
+
+  /************************************************************************* */
+  /* Setter Functions ****************************************************** */
+
+  /**
+   * Resets the current odometry pose
+   *
+   * @param pose The specified pose to which to reset the poseEsitmator
+   */
+  public void resetPose(Pose2d pose) {
+    m_PoseEstimator.resetPosition(getHeading(), getModulePositions(), pose);
+    markPoseReset(TimeUtil.now());
+  }
+
+  /** Zeros the gyro based on alliance color */
+  public void zeroHeadingForAlliance() {
+    imu.zeroYaw(
+        DriverStation.getAlliance().orElse(Alliance.Blue) == Alliance.Blue
+            ? Rotation2d.kZero
+            : Rotation2d.k180deg);
+    resetHeadingController();
+    markPoseReset(TimeUtil.now());
+  }
+
+  /** Zeros the gyro regardless of the alliance */
+  public void zeroHeading() {
+    imu.zeroYaw(Rotation2d.kZero);
+    resetHeadingController();
+    markPoseReset(TimeUtil.now());
+  }
+
+  /**
+   * Adds a vision measurement safely into the PoseEstimator
+   *
+   * @param measurement The pose @ timestamp to add to the pose estimator
+   */
+  // Called by Vision via consumer.accept(TimedPose)
+  public void addVisionMeasurement(TimedPose meas) {
+    odometryLock.lock();
+    try {
+      // Always use measurement timestamp when fusing (enabled path)
+      final double t = meas.timestampSeconds();
+      final Pose2d vision = meas.pose();
+
+      // ENABLED: normal fusion
+      if (!DriverStation.isDisabled()) {
+        disabledVisionInitialized = false;
+        lastDisabledVisionTs = Double.NaN;
+        m_PoseEstimator.addVisionMeasurement(vision, t, meas.stdDevs());
+        return;
+      }
+
+      // DISABLED -- check if within "coast phase"
+      final boolean coast = isDisabledCoast(t);
+
+      // If coasting,
+      if (coast) {
+        final double coastAge = t - getDisabledCoastStartTs();
+        Logger.recordOutput("Vision/Debug/disabledCoastAge", coastAge);
+
+        // Ignore vision briefly right after ENABLE->DISABLE (prevents “phase mismatch” at disable
+        // edge)
+        if (coastAge >= 0.0 && coastAge < DrivebaseConstants.kDisabledVisionIgnoreAfterDisableSec) {
+          Logger.recordOutput("Vision/Debug/disabledIgnoreEarlyCoast", true);
+          return;
+        }
+      }
+      Logger.recordOutput("Vision/Debug/disabledIgnoreEarlyCoast", false);
+
+      // If we're coasting, avoid snapping Pose to Vision; lean gentler than stationary.
+      final double alpha =
+          coast
+              ? Math.min(
+                  DrivebaseConstants.kDisabledVisionBlendAlpha,
+                  DrivebaseConstants.kDisabledVisionCoastBlendAlpha)
+              : DrivebaseConstants.kDisabledVisionBlendAlpha;
+
+      // "Current" for blending target (estimator pose)
+      final Pose2d current = m_PoseEstimator.getEstimatedPosition();
+
+      // Debug
+      Logger.recordOutput("Vision/Debug/disabledCoast", coast);
+      Logger.recordOutput("Vision/Debug/disabledVisionInitialized", disabledVisionInitialized);
+      Logger.recordOutput("Vision/Debug/disabledVisionTs", t);
+      Logger.recordOutput(
+          "Vision/Debug/disabledVisionAge",
+          Double.isFinite(lastDisabledVisionTs) ? (t - lastDisabledVisionTs) : Double.NaN);
+
+      // Check if the last while-disabled vision timestamp is stale (too old)
+      final boolean stale =
+          Double.isFinite(lastDisabledVisionTs)
+              && (t - lastDisabledVisionTs) > DrivebaseConstants.kDisabledVisionStale;
+      Logger.recordOutput("Vision/Debug/visionStale", stale);
+
+      // If coasting, intentionally DO NOT snap; reset initialization so that once coast ends, the
+      // first good stationary frame snaps.
+      if (coast) {
+        disabledVisionInitialized = false;
+      }
+
+      // If not initialized AND not coasting: snap hard to vision once
+      if (!disabledVisionInitialized && !coast) {
+        disabledVisionInitialized = true;
+        lastDisabledVisionPose = vision;
+        lastDisabledVisionTs = t;
+
+        m_PoseEstimator.resetPosition(getHeading(), getModulePositions(), vision);
+        markPoseReset(t);
+        poseBufferAddSample(t, vision);
+
+        Logger.recordOutput("Vision/DisabledInitSnap", true);
+        Logger.recordOutput("Vision/DisabledReject", false);
+        Logger.recordOutput("Vision/DisabledBlendAlphaUsed", alpha);
+        return;
+      }
+      Logger.recordOutput("Vision/DisabledInitSnap", false);
+
+      // Check that there is not a huge jump from the last accepted disabled vision pose
+      final Pose2d gateRef =
+          Double.isFinite(lastDisabledVisionTs) ? lastDisabledVisionPose : vision;
+
+      final double deltaTranslation = gateRef.getTranslation().getDistance(vision.getTranslation());
+      final double deltaRotation =
+          Math.abs(gateRef.getRotation().minus(vision.getRotation()).getRadians());
+
+      Logger.recordOutput("Vision/Debug/dTransFromLastVision", deltaTranslation);
+      Logger.recordOutput("Vision/Debug/dRotFromLastVision", deltaRotation);
+
+      // Reject large jumps only if vision measurement is not stale (large delta-T can mean large
+      // change in position)
+      if (!stale
+          && (deltaTranslation > DrivebaseConstants.kDisabledVisionMaxJumpM
+              || deltaRotation > DrivebaseConstants.kDisabledVisionMaxJumpRad)) {
+        Logger.recordOutput("Vision/DisabledReject", true);
+        Logger.recordOutput("Vision/DisabledBlendAlphaUsed", alpha);
+        return;
+      }
+      Logger.recordOutput("Vision/DisabledReject", false);
+
+      // Accept this vision frame as the new reference
+      lastDisabledVisionPose = vision;
+      lastDisabledVisionTs = t;
+
+      // Blend toward vision -- gentle correction
+      final Pose2d blended = current.interpolate(vision, alpha);
+
+      // Push values to pose estimator and pose buffer
+      m_PoseEstimator.resetPosition(getHeading(), getModulePositions(), blended);
+      markPoseReset(t);
+      poseBufferAddSample(t, blended);
+
+      Logger.recordOutput("Vision/DisabledBlendedPose", blended);
+      Logger.recordOutput("Vision/DisabledBlendAlphaUsed", alpha);
+
+    } finally {
+      odometryLock.unlock();
+    }
+  }
+
+  /**
+   * Sets the EPOCH and TIMESTAMP for a pose reset
+   *
+   * @param fpgaNow The FPGA timestamp of the pose reset
+   */
+  private void markPoseReset(double fpgaNow) {
+    lastPoseResetTimestamp = fpgaNow;
+    poseResetEpoch++;
+    Logger.recordOutput("Drive/PoseResetEpoch", poseResetEpoch);
+    Logger.recordOutput("Drive/PoseResetTimestamp", lastPoseResetTimestamp);
+  }
+
+  /************************************************************************* */
+  /**
+   * DriveOdometry Helpers (package-private)
+   *
+   * <p>The pose estimator and pose buffers are owned by Drive, but DriveOdometry needs access to
+   * them in order to update and process the odometry. These functions are the appropriate
+   * pass-throughs to allow this functionality.
+   */
+
+  /** Update the pose estimator at a timestamp */
+  void poseEstimatorUpdateWithTime(double t, Rotation2d yaw, SwerveModulePosition[] positions) {
+    m_PoseEstimator.updateWithTime(t, yaw, positions);
+  }
+
+  /** Add a sample to the pose buffer */
+  void poseBufferAddSample(double t, Pose2d pose) {
+    poseBuffer.addSample(t, pose);
+  }
+
+  /** Yaw buffer helper */
+  double yawBufferSampleOr(double t, double fallbackYawRad) {
+    return yawBuffer.getSample(t).orElse(fallbackYawRad);
+  }
+
+  /** Yaw buffer helper */
+  void yawBuffersAddSample(double t, double yawRad, double yawRateRadPerSec) {
+    yawBuffer.addSample(t, yawRad);
+    yawRateBuffer.addSample(t, yawRateRadPerSec);
+  }
+
+  /** Yaw buffer helper */
+  void yawBuffersFillFromQueue(double[] yawTs, double[] yawPosRad) {
+    for (int k = 0; k < yawTs.length; k++) {
+      yawBuffer.addSample(yawTs[k], yawPosRad[k]);
+      if (k > 0) {
+        double dt = yawTs[k] - yawTs[k - 1];
+        if (dt > 1e-6) {
+          yawRateBuffer.addSample(yawTs[k], yawRateRadPerSec(yawPosRad[k - 1], yawPosRad[k], dt));
+        }
+      }
+    }
+  }
+
+  /** Yaw buffer helper */
+  void yawBuffersAddSampleIndexAligned(double t, double[] yawTs, double[] yawPos, int i) {
+    yawBuffer.addSample(t, yawPos[i]);
+    if (i > 0) {
+      double dt = yawTs[i] - yawTs[i - 1];
+      if (dt > 1e-6) {
+        yawRateBuffer.addSample(t, yawRateRadPerSec(yawPos[i - 1], yawPos[i], dt));
+      }
+    }
+  }
+
+  static double yawRateRadPerSec(double previousYawRad, double currentYawRad, double dtSec) {
+    if (dtSec <= 1e-6) return 0.0;
+    return MathUtil.angleModulus(currentYawRad - previousYawRad) / dtSec;
+  }
+
+  /** Set the gyroDisconnectedAlert */
+  void setGyroDisconnectedAlert(boolean disconnected) {
+    gyroDisconnectedAlert.set(disconnected);
+  }
+
+  /************************************************************************* */
+  /** Simulation Getter Functions (from simPhysics) */
+  public Pose2d getSimPose() {
+    return simPhysics.getPose();
+  }
+
+  public double getSimYawRad() {
+    return simPhysics.getYaw().getRadians();
+  }
+
+  public double getSimYawRateRadPerSec() {
+    return simPhysics.getOmegaRadPerSec();
+  }
+
+  /************************************************************************* */
+  /** CHOREO SECTION (Ignore if AutoType == PATHPLANNER) ******************* */
+
+  /** Choreo: Reset odometry */
+  public void resetOdometry(Pose2d pose) {
+    resetPose(pose);
+  }
+
+  // Choreo Controller Values
+  private final PIDController m_pathXController =
+      new PIDController(
+          AutoConstants.kChoreoDrivePID.kP,
+          AutoConstants.kChoreoDrivePID.kI,
+          AutoConstants.kChoreoDrivePID.kD);
+  private final PIDController m_pathYController =
+      new PIDController(
+          AutoConstants.kChoreoDrivePID.kP,
+          AutoConstants.kChoreoDrivePID.kI,
+          AutoConstants.kChoreoDrivePID.kD);
+  private final PIDController m_pathThetaController =
+      new PIDController(
+          AutoConstants.kChoreoSteerPID.kP,
+          AutoConstants.kChoreoSteerPID.kI,
+          AutoConstants.kChoreoSteerPID.kD);
+
+  /**
+   * Follows the given field-centric path sample with PID for Choreo
+   *
+   * @param pose Current pose of the robot
+   * @param sample Sample along the path to follow
+   */
+  public void choreoController(Pose2d pose, SwerveSample sample) {
+    var targetSpeeds = sample.getChassisSpeeds();
+    targetSpeeds.vxMetersPerSecond += m_pathXController.calculate(pose.getX(), sample.x);
+    targetSpeeds.vyMetersPerSecond += m_pathYController.calculate(pose.getY(), sample.y);
+    targetSpeeds.omegaRadiansPerSecond +=
+        m_pathThetaController.calculate(pose.getRotation().getRadians(), sample.heading);
+
+    runVelocity(ChassisSpeeds.fromFieldRelativeSpeeds(targetSpeeds, getHeading()));
+  }
+
+  public void followTrajectory(SwerveSample sample) {
+    // Get the current pose of the robot
+    Pose2d pose = getPose();
+
+    // Choreo samples are field-relative; convert to robot-relative before sending to modules.
+    ChassisSpeeds fieldRelativeSpeeds =
+        new ChassisSpeeds(
+            sample.vx + m_pathXController.calculate(pose.getX(), sample.x),
+            sample.vy + m_pathYController.calculate(pose.getY(), sample.y),
+            sample.omega
+                + m_pathThetaController.calculate(pose.getRotation().getRadians(), sample.heading));
+
+    // Apply the generated speeds
+    runVelocity(ChassisSpeeds.fromFieldRelativeSpeeds(fieldRelativeSpeeds, pose.getRotation()));
+  }
+}
